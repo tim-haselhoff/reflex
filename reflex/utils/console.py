@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import inspect
+import logging
 import os
 import shutil
 import sys
@@ -50,6 +51,56 @@ _EMITTED_LOGS = set()
 
 # Prints which have been printed.
 _EMITTED_PRINTS = set()
+
+
+class LogFormatter(logging.Formatter):
+    """Custom log formatter to add colors based on log level."""
+
+    debug_color = "\x1b[0;94;49m"
+    info_color = "\x1b[0;92;49m"
+    warning_color = "\x1b[0;93;49m"
+    error_color = "\x1b[0;91;49m"
+    critical_color = "\x1b[1;91;49m"
+    reset = "\x1b[0m"
+    log_format = "[%(levelname)s] - %(message)s"
+
+    FORMATS = {
+        logging.DEBUG: debug_color + log_format + reset,
+        logging.INFO: info_color + log_format + reset,
+        logging.WARNING: warning_color + log_format + reset,
+        logging.ERROR: error_color + log_format + reset,
+        logging.CRITICAL: critical_color + log_format + reset,
+    }
+
+    def format(self, record):
+        """Format the log record with colors.
+
+        Args:
+            record: The log record.
+
+        Returns:
+            The formatted log message.
+        """
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+    @classmethod
+    def create_logger(cls) -> logging.Logger:
+        """Create a logger with the custom formatter.
+
+        Returns:
+            The configured logger.
+        """
+        logger = logging.getLogger(__name__)
+        handler = logging.StreamHandler()
+        handler.setFormatter(cls())
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        return logger
+
+
+_logger = LogFormatter.create_logger()
 
 
 def set_log_level(log_level: LogLevel | None):
@@ -174,7 +225,8 @@ def debug(msg: str, *, dedupe: bool = False, **kwargs):
         if progress := kwargs.pop("progress", None):
             progress.console.print(msg_, **kwargs)
         else:
-            print(msg_, **kwargs)
+            # print(msg_, **kwargs)
+            _logger.debug(msg, **kwargs)
     if should_use_log_file_console() and kwargs.pop("progress", None) is None:
         print_to_log_file(f"[purple]Debug: {msg}[/purple]", **kwargs)
 
@@ -192,7 +244,8 @@ def info(msg: str, *, dedupe: bool = False, **kwargs):
             if msg in _EMITTED_INFO:
                 return
             _EMITTED_INFO.add(msg)
-        print(f"[cyan]Info: {msg}[/cyan]", **kwargs)
+        # print(f"[cyan]Info: {msg}[/cyan]", **kwargs)
+        _logger.info(msg, **kwargs)
     if should_use_log_file_console():
         print_to_log_file(f"[cyan]Info: {msg}[/cyan]", **kwargs)
 
@@ -256,7 +309,8 @@ def warn(msg: str, *, dedupe: bool = False, **kwargs):
             if msg in _EMITTED_WARNINGS:
                 return
             _EMITTED_WARNINGS.add(msg)
-        print(f"[orange1]Warning: {msg}[/orange1]", **kwargs)
+        # print(f"[orange1]Warning: {msg}[/orange1]", **kwargs)
+        _logger.warning(msg, **kwargs)
     if should_use_log_file_console():
         print_to_log_file(f"[orange1]Warning: {msg}[/orange1]", **kwargs)
 
@@ -338,7 +392,8 @@ def deprecate(
             f"removed in {removal_version}.{loc}"
         )
         if _LOG_LEVEL <= LogLevel.WARNING:
-            print(f"[yellow]DeprecationWarning: {msg}[/yellow]", **kwargs)
+            # print(f"[yellow]DeprecationWarning: {msg}[/yellow]", **kwargs)
+            _logger.warning(f"DeprecationWarning: {msg}", **kwargs)
         if should_use_log_file_console():
             print_to_log_file(f"[yellow]DeprecationWarning: {msg}[/yellow]", **kwargs)
         if dedupe:
@@ -358,7 +413,8 @@ def error(msg: str, *, dedupe: bool = False, **kwargs):
             if msg in _EMITTED_ERRORS:
                 return
             _EMITTED_ERRORS.add(msg)
-        _print_stderr(f"[red]{msg}[/red]", **kwargs)
+        # _print_stderr(f"[red]{msg}[/red]", **kwargs)
+        _logger.error(msg, **kwargs)
     if should_use_log_file_console():
         print_to_log_file(f"[red]{msg}[/red]", **kwargs)
 
