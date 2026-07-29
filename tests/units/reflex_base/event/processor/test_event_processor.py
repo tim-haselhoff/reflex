@@ -193,6 +193,52 @@ async def _superseding_root_handler(value: str = "default", child: str = "load")
 _superseding_root_handler._reflex_supersedes = True  # type: ignore[attr-defined]
 
 
+async def _superseding_chained_load_handler(value: str = "default"):
+    """A ``supersedes``-marked handler that is only ever reached by chaining.
+
+    Announces itself via the ``{value}_started`` gate, then blocks on the
+    ``{value}_release`` gate (if present) so the test controls when it finishes;
+    logs ``{value}_cancelled`` if cancelled instead. It carries ``supersedes``
+    but is never a root event, so supersession never engages for it.
+
+    Args:
+        value: The value to log; also names the ``_started``/``_release`` gates.
+    """
+    started = _GATES.get(f"{value}_started")
+    if started is not None:
+        started.set()
+    release = _GATES.get(f"{value}_release")
+    try:
+        if release is not None:
+            await release.wait()
+    except asyncio.CancelledError:
+        _CALL_LOG.append({"value": f"{value}_cancelled"})
+        raise
+    _CALL_LOG.append({"value": value})
+
+
+_superseding_chained_load_handler._reflex_supersedes = True  # type: ignore[attr-defined]
+# Background so a blocked stale child does not serialize the per-token queue,
+# mirroring the real setup where the chained recalculation is a background task.
+_superseding_chained_load_handler._reflex_background_task = True  # type: ignore[attr-defined]
+
+
+async def _background_root_chaining_handler(value: str = "default"):
+    """A background root that chains the superseding background child handler.
+
+    Mirrors the real setup (a background trigger such as ``toggle_column`` that
+    chains the background, ``supersedes`` recalculation).
+
+    Args:
+        value: Label forwarded to the chained child event.
+    """
+    ctx = EventContext.get()
+    await ctx.enqueue(Event.from_event_type(superseding_chained_load_event(value))[0])
+
+
+_background_root_chaining_handler._reflex_background_task = True  # type: ignore[attr-defined]
+
+
 noop_event = EventHandler(fn=_noop_handler)
 slow_event = EventHandler(fn=_slow_handler)
 error_event = EventHandler(fn=_error_handler)
@@ -210,6 +256,8 @@ gated_logging_event = EventHandler(fn=_gated_logging_handler)
 cancellable_load_event = EventHandler(fn=_cancellable_load_handler)
 resurrecting_load_event = EventHandler(fn=_resurrecting_load_handler)
 superseding_root_event = EventHandler(fn=_superseding_root_handler)
+superseding_chained_load_event = EventHandler(fn=_superseding_chained_load_handler)
+background_root_chaining_event = EventHandler(fn=_background_root_chaining_handler)
 
 
 @pytest.fixture(autouse=True)
@@ -239,6 +287,8 @@ def _register_handlers(forked_registration_context: RegistrationContext):
         cancellable_load_event,
         resurrecting_load_event,
         superseding_root_event,
+        superseding_chained_load_event,
+        background_root_chaining_event,
     ):
         RegistrationContext.register_event_handler(handler)
 
@@ -955,3 +1005,60 @@ async def test_superseded_chain_cannot_chain_new_events(
 
     assert {"value": "resurrected"} not in _CALL_LOG
     assert {"value": "fresh"} in _CALL_LOG
+
+
+async def test_supersedes_on_event_chained_from_background_cancels_previous(
+    processor: EventProcessor,
+    token: str,
+):
+    """A ``supersedes`` event chained from a background event must cancel the
+    previous still-in-flight one.
+
+    Reproduces #1776: a background root (e.g. ``toggle_column``) chains a
+    background, ``supersedes`` recalculation. Firing the root again should
+    cancel the previous chain's recalculation so a slow, stale run cannot
+    overwrite newer state.
+
+    This is the mirror image of ``test_superseding_event_cancels_previous_chain``
+    (where the *root* carries ``supersedes``). It currently FAILS: supersession
+    is only wired for root events (``parent_future is None`` in
+    ``EventProcessor.enqueue``), so a ``supersedes`` handler reached only by
+    being chained from another (background) event is never registered and the
+    stale run is not cancelled.
+
+    Args:
+        processor: The event processor fixture.
+        token: The client token.
+    """
+    _GATES["stale_started"] = asyncio.Event()
+    _GATES["stale_release"] = asyncio.Event()
+    processor.configure()
+    async with processor as ep:
+        stale = await ep.enqueue(
+            token, Event.from_event_type(background_root_chaining_event("stale"))[0]
+        )
+        await asyncio.wait_for(_GATES["stale_started"].wait(), timeout=1)
+
+        # A second invocation whose chained child shares the same event name.
+        # Enqueuing it must supersede and cancel the in-flight "stale" child.
+        current = await ep.enqueue(
+            token, Event.from_event_type(background_root_chaining_event("fresh"))[0]
+        )
+        await asyncio.wait_for(current.wait_all(), timeout=1)
+
+        # Give supersession a bounded number of ticks to cancel the stale child.
+        for _ in range(100):
+            if {"value": "stale_cancelled"} in _CALL_LOG:
+                break
+            await asyncio.sleep(0)
+        # Release so a NON-cancelled (buggy) stale chain completes instead of
+        # hanging; a correctly cancelled one has already unwound by now.
+        _GATES["stale_release"].set()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(stale.wait_all(), timeout=1)
+
+    # The newer invocation must have cancelled the stale recalculation before it
+    # could complete and overwrite state.
+    assert {"value": "fresh"} in _CALL_LOG
+    assert {"value": "stale_cancelled"} in _CALL_LOG
+    assert {"value": "stale"} not in _CALL_LOG
